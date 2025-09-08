@@ -1,0 +1,454 @@
+# WASM Integration Copyright (c) 2025 Superstruct Ltd, New Zealand
+# Licensed under the same license as the underlying rapier project (Apache License 2.0)
+
+name: Rapier WASM CI
+
+on:
+  push:
+    branches: [wasm]
+  pull_request:
+    branches: [wasm]
+  release:
+    types: [created]
+
+env:
+  RUST_VERSION: '1.86'
+  NODE_VERSION: '22'
+  WASM_PACK_VERSION: '0.12.1'
+
+jobs:
+  build:
+    name: Build & Test Rapier WASM
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [bundler, web]
+        features: [2d, 3d, both]
+        precision: [f32, f64]
+        optimization: [debug, release]
+        exclude:
+          # Reduce matrix size for faster CI
+          - optimization: debug
+            precision: f64
+          - target: web
+            features: 2d
+            precision: f64
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
+          
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh -s -- --version ${{ env.WASM_PACK_VERSION }}
+          
+      - name: Install binaryen for optimization
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          
+      - name: Build WASM module
+        run: |
+          chmod +x build-wasm.sh
+          ./build-wasm.sh ${{ matrix.target }} ${{ matrix.features }} ${{ matrix.precision }} ${{ matrix.optimization }}
+          
+      - name: Validate build outputs
+        run: |
+          echo "Checking build artifacts..."
+          ls -la pkg/
+          
+          # Check required files exist
+          for file in rapier_wasm.js rapier_wasm.wasm rapier_wasm.d.ts package.json README.md; do
+            if [ -f "pkg/$file" ]; then
+              echo "✓ $file exists ($(du -h pkg/$file | cut -f1))"
+            else
+              echo "✗ $file missing"
+              exit 1
+            fi
+          done
+          
+          # Validate WASM binary
+          if command -v wasm-validate &> /dev/null; then
+            wasm-validate pkg/rapier_wasm.wasm && echo "✓ WASM binary validation passed"
+          fi
+          
+      - name: Install Node.js test dependencies  
+        run: |
+          echo '{"type": "module"}' > package.json
+          
+      - name: Run integration tests
+        run: |
+          echo "Running WASM integration tests..."
+          node tests/wasm_integration_test.js
+          
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapier-wasm-${{ matrix.target }}-${{ matrix.features }}-${{ matrix.precision }}-${{ matrix.optimization }}
+          path: pkg/
+          retention-days: 30
+
+  performance:
+    name: Performance Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/wasm'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rapier-wasm-bundler-both-f32-release
+          path: pkg/
+          
+      - name: Run performance benchmarks
+        run: |
+          echo '{\"type\": \"module\"}' > package.json
+          echo "## 📊 Rapier.wasm Performance Benchmarks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Create benchmark script
+          cat > benchmark.js << 'EOF'
+          import { promises as fs } from 'fs';
+          import { performance } from 'perf_hooks';
+          
+          async function runBenchmarks() {
+            try {
+              const { default: init, PhysicsEngine, WorldConfig, RapierUtils, PhysicsBenchmark } = await import('./pkg/rapier_wasm.js');
+              await init();
+              
+              console.log("| Test | Bodies | Steps | FPS | Notes |");
+              console.log("|------|--------|--------|-----|-------|");
+              
+              // Basic performance test
+              const benchmark = new PhysicsBenchmark();
+              
+              const tests = [
+                { bodies: 10, steps: 100, name: 'Small' },
+                { bodies: 100, steps: 50, name: 'Medium' },
+                { bodies: 500, steps: 20, name: 'Large' }
+              ];
+              
+              for (const test of tests) {
+                try {
+                  const result = benchmark.benchmark_physics_step(test.bodies, test.steps);
+                  const fpsMatch = result.match(/Estimated FPS: ([\d.]+)/);
+                  const fps = fpsMatch ? parseFloat(fpsMatch[1]).toFixed(1) : 'N/A';
+                  
+                  console.log(`| ${test.name} | ${test.bodies} | ${test.steps} | ${fps} | ${test.bodies <= 100 ? '✓ Good' : fps > 30 ? '✓ Excellent' : '⚠ Acceptable'} |`);
+                } catch (err) {
+                  console.log(`| ${test.name} | ${test.bodies} | ${test.steps} | Error | ${err.message} |`);
+                }
+              }
+              
+              // SIMD and WebGPU feature detection
+              const hasSIMD = RapierUtils.has_simd_support();
+              const hasWebGPU = RapierUtils.has_webgpu_support();
+              const version = RapierUtils.get_version();
+              
+              console.log("");
+              console.log(`**Version**: ${version}`);
+              console.log(`**SIMD Support**: ${hasSIMD ? '✅' : '❌'}`);
+              console.log(`**WebGPU Support**: ${hasWebGPU ? '✅' : '❌'}`);
+              
+              // Math operations benchmark
+              const mathResult = RapierUtils.benchmark_math_operations(10000);
+              console.log(`**Math Performance**: ${mathResult}`);
+              
+            } catch (err) {
+              console.log("Benchmark failed:", err.message);
+            }
+          }
+          
+          runBenchmarks();
+          EOF
+          
+          node benchmark.js >> $GITHUB_STEP_SUMMARY
+
+  quality:
+    name: Code Quality & Security
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+          
+      - name: Check code formatting
+        run: |
+          if [ -f "src/wasm_api.rs" ]; then
+            cargo fmt --manifest-path Cargo-wasm.toml -- --check
+          else
+            echo "No Rust code to format check"
+          fi
+        
+      - name: Run Clippy
+        run: |
+          if [ -f "src/wasm_api.rs" ]; then
+            cargo clippy --manifest-path Cargo-wasm.toml --target wasm32-unknown-unknown -- -D warnings
+          else
+            echo "No Rust code to lint"
+          fi
+        
+      - name: Check for security issues
+        run: |
+          echo "Checking for security issues..."
+          
+          # Check for common security patterns
+          security_issues=0
+          
+          if grep -r "unsafe" --include="*.rs" src/ 2>/dev/null; then
+            echo "⚠️ Found unsafe blocks - review required"
+            security_issues=$((security_issues + 1))
+          fi
+          
+          if grep -r "password\|secret\|key\|token" --include="*.rs" --include="*.js" --exclude-dir=node_modules . 2>/dev/null; then
+            echo "⚠️ Potential sensitive data found"  
+            security_issues=$((security_issues + 1))
+          fi
+          
+          # Check for proper WASM security practices
+          if [ -f "src/wasm_api.rs" ]; then
+            if ! grep -q "console_error_panic_hook" src/wasm_api.rs; then
+              echo "⚠️ Missing panic hook setup"
+              security_issues=$((security_issues + 1))
+            fi
+          fi
+          
+          if [ $security_issues -eq 0 ]; then
+            echo "✓ No obvious security issues detected"
+          else
+            echo "Found $security_issues potential security issues"
+          fi
+        
+      - name: Validate build configuration
+        run: |
+          echo "Checking build configuration..."
+          
+          if [ -f "Cargo-wasm.toml" ]; then
+            echo "✓ WASM-specific Cargo.toml found"
+            
+            # Check for production-ready settings
+            if grep -q 'crate-type = \["cdylib"\]' Cargo-wasm.toml; then
+              echo "✓ Correct crate type for WASM"
+            fi
+            
+            if grep -q 'panic = "abort"' Cargo-wasm.toml; then
+              echo "✓ Panic abort configured for size optimization"
+            fi
+            
+            if grep -q 'lto = true' Cargo-wasm.toml; then
+              echo "✓ Link-time optimization enabled"
+            fi
+          fi
+          
+          if [ -f "build-wasm.sh" ]; then
+            echo "✓ Build script found"
+            
+            if grep -q "wasm-opt" build-wasm.sh; then
+              echo "✓ WASM optimization configured"
+            fi
+          fi
+
+  compatibility:
+    name: Browser Compatibility
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rapier-wasm-web-both-f32-release
+          path: pkg/
+          
+      - name: Test browser compatibility
+        run: |
+          echo "## 🌐 Browser Compatibility Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Create compatibility test
+          cat > compat-test.js << 'EOF'
+          import { promises as fs } from 'fs';
+          
+          async function testCompatibility() {
+            try {
+              const { default: init, RapierUtils } = await import('./pkg/rapier_wasm.js');
+              await init();
+              
+              console.log("| Feature | Status | Notes |");
+              console.log("|---------|--------|--------|");
+              
+              // Test WASM features
+              console.log("| WebAssembly | ✅ | Core WASM support detected |");
+              
+              // Test SIMD
+              const hasSIMD = RapierUtils.has_simd_support();
+              console.log(`| WASM SIMD | ${hasSIMD ? '✅' : '❌'} | ${hasSIMD ? 'SIMD128 available' : 'Fallback to scalar operations'} |`);
+              
+              // Test WebGPU
+              const hasWebGPU = RapierUtils.has_webgpu_support();
+              console.log(`| WebGPU | ${hasWebGPU ? '✅' : '❌'} | ${hasWebGPU ? 'GPU acceleration available' : 'CPU-only mode'} |`);
+              
+              // Test SharedArrayBuffer (for threading)
+              const hasSharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined';
+              console.log(`| SharedArrayBuffer | ${hasSharedArrayBuffer ? '✅' : '❌'} | ${hasSharedArrayBuffer ? 'Threading support possible' : 'Single-threaded only'} |`);
+              
+              // Test ES Modules
+              console.log("| ES Modules | ✅ | Module loading successful |");
+              
+              // Browser recommendations
+              console.log("");
+              console.log("### Recommended Browser Support");
+              console.log("- **Chrome/Edge 91+**: Full WebGPU + SIMD support");
+              console.log("- **Firefox 89+**: WASM SIMD support");
+              console.log("- **Safari 16.4+**: Basic WASM support");
+              console.log("- **Mobile browsers**: Limited by GPU capabilities");
+              
+            } catch (err) {
+              console.log("Compatibility test failed:", err.message);
+            }
+          }
+          
+          testCompatibility();
+          EOF
+          
+          echo '{\"type\": \"module\"}' > package.json
+          node compat-test.js >> $GITHUB_STEP_SUMMARY
+
+  release:
+    name: Release Package
+    needs: [build, performance, quality, compatibility]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Rust and wasm-pack
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
+          
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        
+      - name: Install binaryen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+        
+      - name: Build release packages
+        run: |
+          chmod +x build-wasm.sh
+          
+          # Build multiple release variants
+          ./build-wasm.sh bundler both f32 release
+          mv pkg pkg-bundler-both-f32
+          
+          ./build-wasm.sh web both f32 release  
+          mv pkg pkg-web-both-f32
+          
+          ./build-wasm.sh bundler 3d f32 release
+          mv pkg pkg-bundler-3d-f32
+          
+          ./build-wasm.sh bundler both f64 release
+          mv pkg pkg-bundler-both-f64
+          
+      - name: Create release archives
+        run: |
+          # Create comprehensive release archive
+          mkdir -p release-assets
+          
+          # Main bundler release
+          tar -czf release-assets/rapier-wasm-bundler-${{ github.event.release.tag_name }}.tar.gz pkg-bundler-both-f32/ docs/ README.md
+          
+          # Web-specific release
+          tar -czf release-assets/rapier-wasm-web-${{ github.event.release.tag_name }}.tar.gz pkg-web-both-f32/ docs/ README.md
+          
+          # 3D-only release
+          tar -czf release-assets/rapier-wasm-3d-${{ github.event.release.tag_name }}.tar.gz pkg-bundler-3d-f32/ docs/ README.md
+          
+          # High-precision release
+          tar -czf release-assets/rapier-wasm-f64-${{ github.event.release.tag_name }}.tar.gz pkg-bundler-both-f64/ docs/ README.md
+          
+          # Create combined release with all variants
+          tar -czf release-assets/rapier-wasm-all-variants-${{ github.event.release.tag_name }}.tar.gz pkg-*/ docs/ README.md
+          
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: release-assets/rapier-wasm-bundler-${{ github.event.release.tag_name }}.tar.gz
+          asset_name: rapier-wasm-bundler-${{ github.event.release.tag_name }}.tar.gz
+          asset_content_type: application/gzip
+          
+      - name: Upload web variant
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: release-assets/rapier-wasm-web-${{ github.event.release.tag_name }}.tar.gz
+          asset_name: rapier-wasm-web-${{ github.event.release.tag_name }}.tar.gz
+          asset_content_type: application/gzip
+          
+      - name: Upload all variants
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: release-assets/rapier-wasm-all-variants-${{ github.event.release.tag_name }}.tar.gz
+          asset_name: rapier-wasm-all-variants-${{ github.event.release.tag_name }}.tar.gz
+          asset_content_type: application/gzip

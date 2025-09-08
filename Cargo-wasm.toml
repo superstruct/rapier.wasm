@@ -1,0 +1,133 @@
+[package]
+name = "rapier-wasm"
+version = "0.28.0"
+authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
+description = "High-performance 2D/3D physics engine for WebAssembly with GPU acceleration support"
+documentation = "https://docs.rs/rapier2d"
+homepage = "https://rapier.rs"
+repository = "https://github.com/superstruct/rapier.wasm"
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.86"
+
+[lib]
+name = "rapier_wasm"
+crate-type = ["cdylib"]
+path = "src/wasm_api.rs"
+
+[features]
+default = ["2d", "3d", "simd", "webgpu"]
+
+# Dimension support
+2d = ["rapier2d"]
+3d = ["rapier3d"]
+
+# Precision modes  
+f32 = []
+f64 = []
+
+# Performance optimizations
+simd = ["rapier2d/simd-stable", "rapier3d/simd-stable"]
+parallel = ["rapier2d/parallel", "rapier3d/parallel"] 
+
+# WebGPU acceleration
+webgpu = ["dep:wgpu", "compute-shaders"]
+compute-shaders = []
+
+# Serialization support
+serde = ["rapier2d/serde-serialize", "rapier3d/serde-serialize", "dep:serde", "dep:serde-wasm-bindgen"]
+
+# Debug and profiling
+debug-render = ["rapier2d/debug-render", "rapier3d/debug-render"]
+profiler = ["rapier2d/profiler", "rapier3d/profiler", "dep:web-time"]
+deterministic = ["rapier2d/enhanced-determinism", "rapier3d/enhanced-determinism"]
+
+# Development features
+dev-testbed = ["debug-render", "profiler"]
+
+[dependencies]
+# Core Rapier physics engines
+rapier2d = { version = "0.28", optional = true, default-features = false }
+rapier3d = { version = "0.28", optional = true, default-features = false }
+
+# WASM bindings and JavaScript interop
+wasm-bindgen = { version = "0.2.84", features = ["serde-serialize"] }
+js-sys = "0.3.61"
+web-sys = { version = "0.3.61", features = [
+    "console",
+    "Performance",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "WebGl2RenderingContext",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    # WebGPU support
+    "Gpu",
+    "GpuAdapter", 
+    "GpuDevice",
+    "GpuQueue",
+    "GpuBuffer",
+    "GpuBufferUsage",
+    "GpuComputePipeline",
+    "GpuComputePipelineDescriptor",
+    "GpuBindGroup",
+    "GpuBindGroupLayout",
+    "GpuCommandEncoder",
+    "GpuComputePassEncoder",
+    # TypedArrays for efficient data transfer
+    "Float32Array",
+    "Uint32Array",
+    "ArrayBuffer",
+]}
+
+# WebGPU integration (optional)
+wgpu = { version = "0.20", optional = true, features = ["webgpu"] }
+
+# Serialization support (optional)
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+# Performance and utilities
+web-time = { version = "1.1", optional = true }
+console_error_panic_hook = "0.1.7"
+wee_alloc = "0.4.5"
+
+# Logging
+log = "0.4"
+wasm-logger = "0.2.0"
+
+# Mathematical utilities 
+nalgebra = { version = "0.34", features = ["serde-serialize"] }
+approx = "0.5"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.34"
+oorandom = { version = "11", default-features = false }
+
+[profile.release]
+# Optimize for size and performance in WASM
+opt-level = "s"          # Optimize for size
+lto = true              # Enable link-time optimization  
+codegen-units = 1       # Single codegen unit for better optimization
+panic = "abort"         # Reduce WASM binary size
+strip = true           # Strip debug symbols
+
+[profile.dev]
+# Faster development builds
+opt-level = 1
+
+[profile.dev.package."*"]
+# Optimize dependencies even in dev mode
+opt-level = 3
+
+# WASM-specific target configuration
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Os", "--enable-simd"]  # Optimize for size with SIMD
+
+[package.metadata.wasm-pack.profile.dev] 
+wasm-opt = false  # Skip optimization in development
